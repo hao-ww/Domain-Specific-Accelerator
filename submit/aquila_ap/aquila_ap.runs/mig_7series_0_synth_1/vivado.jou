@@ -1,0 +1,24 @@
+#-----------------------------------------------------------
+# Vivado v2025.1 (64-bit)
+# SW Build 6140274 on Thu May 22 00:12:29 MDT 2025
+# IP Build 6138677 on Thu May 22 03:10:11 MDT 2025
+# SharedData Build 6139179 on Tue May 20 17:58:58 MDT 2025
+# Start of session at: Wed Dec 31 10:43:13 2025
+# Process ID         : 36608
+# Current directory  : D:/code_projects/mpd/hw5/submit/aquila_ap/aquila_ap.runs/mig_7series_0_synth_1
+# Command line       : vivado.exe -log mig_7series_0.vds -product Vivado -mode batch -messageDb vivado.pb -notrace -source mig_7series_0.tcl
+# Log file           : D:/code_projects/mpd/hw5/submit/aquila_ap/aquila_ap.runs/mig_7series_0_synth_1/mig_7series_0.vds
+# Journal file       : D:/code_projects/mpd/hw5/submit/aquila_ap/aquila_ap.runs/mig_7series_0_synth_1\vivado.jou
+# Running On         : LAPTOP-8ADVV7HH
+# Platform           : Windows Server 2016 or Windows 10
+# Operating System   : 26100
+# Processor Detail   : 12th Gen Intel(R) Core(TM) i7-12700H
+# CPU Frequency      : 2688 MHz
+# CPU Physical cores : 14
+# CPU Logical cores  : 20
+# Host memory        : 33962 MB
+# Swap memory        : 4707 MB
+# Total Virtual      : 38670 MB
+# Available Virtual  : 3994 MB
+#-----------------------------------------------------------
+source mig_7series_0.tcl -notrace
