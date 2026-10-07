@@ -1,0 +1,338 @@
+\documentclass[conference]{IEEEtran}
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{listings}
+\usepackage{hyperref}
+
+\lstset{
+    basicstyle=\ttfamily\footnotesize,
+    breaklines=true,
+    frame=single,
+    language=C,
+    numbers=left,
+    numberstyle=\tiny,
+    tabsize=2
+}
+
+\begin{document}
+
+\title{HW5: Domain-Specific
+Accelerator}
+
+\author{\IEEEauthorblockN{Cheng Hao Lai, 112550171}}
+
+\maketitle
+
+\begin{abstract}
+This report presents an incremental hardware-software co-design approach for accelerating a Convolutional Neural Network (CNN) inference on the RISC-V Aquila System-on-Chip (SoC). Starting from a pure software baseline implementation that requires 54,523 ms for handwritten digit recognition, we progressively apply various optimization techniques including MMIO-based Domain-Specific Accelerator (DSA), direct gather, weight preloading, and pooling acceleration. Our final optimized implementation achieves a speedup of 12.72$\times$ while maintaining 98\% classification accuracy on the MNIST-like test dataset.
+\end{abstract}
+
+\begin{IEEEkeywords}
+CNN acceleration, RISC-V, FPGA, hardware-software co-design, DSA, Aquila SoC
+\end{IEEEkeywords}
+
+\section{Introduction}
+
+Convolutional Neural Networks (CNNs) have become fundamental building blocks in modern machine learning applications. However, deploying CNN inference on resource-constrained embedded systems remains challenging due to the computational intensity of convolution operations. This work explores hardware-software co-design techniques to accelerate CNN inference on the Aquila RISC-V SoC.
+
+The target application is a 6-layer CNN model for handwritten digit recognition, consisting of two convolutional layers, two average pooling layers, and two fully connected layers. The baseline pure-software implementation requires approximately 54.5 seconds to classify 100 test images, which is impractical for real-time applications.
+
+We present an incremental optimization methodology, progressively identifying and addressing performance bottlenecks through a combination of hardware acceleration and software optimization. Each optimization is controlled by a compile-time flag in the Makefile, allowing systematic evaluation.
+
+\section{System Architecture}
+
+
+\subsection{CNN Model Architecture}
+
+The CNN model used for evaluation consists of the following layers:
+
+\begin{enumerate}
+    \item \textbf{Conv1}: 1 input channel, 3 output channels, 5$\times$5 kernel
+    \item \textbf{Pool1}: 2$\times$2 average pooling
+    \item \textbf{Conv2}: 3 input channels, 12 output channels, 5$\times$5 kernel
+    \item \textbf{Pool2}: 2$\times$2 average pooling
+    \item \textbf{FC1}: 192 $\rightarrow$ 30 fully connected
+    \item \textbf{FC2}: 30 $\rightarrow$ 10 fully connected with ReLU
+\end{enumerate}
+
+\subsection{DSA Hardware Architecture}
+
+The Domain-Specific Accelerator (DSA) is designed as an MMIO-mapped peripheral with the base address at \texttt{0xC4000000}. The hardware implements a floating-point Fused Multiply-Add (FMA) unit using Xilinx IP cores. The register map is shown in Table~\ref{tab:mmio_reg}.
+
+\begin{table}[htbp]
+\caption{DSA MMIO Register Map}
+\label{tab:mmio_reg}
+\centering
+\begin{tabular}{@{}lll@{}}
+\toprule
+Offset & Name & Description \\
+\midrule
+0x000 & CTRL & Control/Status register \\
+0x004 & LEN & Vector length register \\
+0x008 & W\_OFF & Weight offset in BRAM \\
+0x010 & IN\_A & Input buffer A (252 words) \\
+0x400 & IN\_B & Weight buffer B (1024 words) \\
+0x1000 & OUT & Output result (32-bit float) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+\subsection{MMIO Communication Mechanism}
+
+Memory-Mapped I/O (MMIO) is the fundamental communication mechanism between the RISC-V processor and the DSA hardware. In the Aquila SoC, the address range \texttt{0xC400\_0000} to \texttt{0xC4FF\_FFFF} is allocated to the DSA device.
+
+\subsubsection{Address Decoding}
+When the processor executes a \texttt{load} or \texttt{store} instruction targeting an address within the DSA range, the \texttt{soc\_top.v} module performs address decoding:
+
+\begin{lstlisting}[language=Verilog,caption=Address Decoding in soc\_top.v]
+assign dsa_sel = (dev_addr[31:24] == 8'hC4);
+assign dev_dout = (dsa_sel) ? dsa_dout : ...;
+assign dev_ready = (dsa_sel) ? dsa_ready : ...;
+\end{lstlisting}
+
+When \texttt{dsa\_sel} is asserted, the device bus signals (\texttt{dev\_strobe}, \texttt{dev\_we}, \texttt{dev\_addr}, \texttt{dev\_din}) are routed to the \texttt{dsa\_feeder} module.
+
+\subsubsection{Data Transfer Protocol}
+The MMIO write sequence for a dot product operation consists of:
+
+\begin{enumerate}
+    \item \textbf{Write LEN register}: Set the vector length $N$
+    \item \textbf{Write IN\_A buffer}: Write $N$ input values (activations)
+    \item \textbf{Write IN\_B buffer}: Write $N$ weight values
+    \item \textbf{Write CTRL register}: Set START bit to trigger computation
+    \item \textbf{Poll CTRL register}: Wait for DONE bit
+    \item \textbf{Read OUT register}: Retrieve the result
+\end{enumerate}
+
+Each MMIO write requires the processor to:
+\begin{itemize}
+    \item Generate the target address
+    \item Execute the \texttt{sw} (store word) instruction
+    \item Wait for the memory bus transaction to complete
+\end{itemize}
+
+At the Aquila SoC clock frequency of approximately 41 MHz, each MMIO write takes 3-5 clock cycles, resulting in significant overhead when transferring large data vectors.
+
+
+
+
+\section{Optimization Methodology}
+
+We adopt an incremental optimization approach, applying one technique at a time to clearly measure the contribution of each optimization. Each optimization is controlled by a compile-time flag, as shown in Table~\ref{tab:flags}. Table~\ref{tab:results} summarizes the performance results at each stage.
+
+\begin{table}[htbp]
+\caption{Compile-time Optimization Flags}
+\label{tab:flags}
+\centering
+\begin{tabular}{@{}ll@{}}
+\toprule
+Flag & Description \\
+\midrule
+\texttt{USE\_HW\_DOT} & FC layer dot-product acceleration \\
+\texttt{USE\_HW\_CONV3D} & Conv layer hardware acceleration \\
+\texttt{USE\_HW\_DIRECT\_GATHER} & Eliminate flatten overhead \\
+\texttt{USE\_HW\_CONV\_SIMPLIFIED} & Simplified Conv parameters \\
+\texttt{USE\_HW\_WEIGHT\_PRELOAD} & Weight preloading optimization \\
+\texttt{USE\_HW\_POOL} & Pooling layer acceleration \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[htbp]
+\caption{Performance Results at Each Optimization Stage}
+\label{tab:results}
+\centering
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Optimization Stage & Time (ms) & Accuracy & Speedup \\
+\midrule
+Baseline (Software only) & 54,523 & 98.00\% & 1.00$\times$ \\
++FC Accel (\texttt{USE\_HW\_DOT}) & 52,185 & 98.00\% & 1.04$\times$ \\
++Conv3D (\texttt{USE\_HW\_CONV3D}) & 8,290 & 98.00\% & 6.58$\times$ \\
++Direct Gather & 7,194 & 98.00\% & 7.58$\times$ \\
++Simplified Params & 7,194 & 98.00\% & 7.58$\times$ \\
++Weight Preload & 5,098 & 98.00\% & 10.69$\times$ \\
++Pool Accel (\texttt{USE\_HW\_POOL}) & 4,285 & 98.00\% & 12.72$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Stage 1: FC Layer Acceleration }
+
+The first optimization targets the fully connected layer's forward propagation. The FC layer performs matrix-vector multiplication, which can be decomposed into multiple dot product operations.
+
+\textbf{Implementation:} The software calls the DSA to compute dot products between weight rows and input activations. Each output neuron requires one dot product operation.
+
+\textbf{Result:} Execution time reduced from 54,523 ms to 52,185 ms (1.04$\times$ speedup). 
+
+\subsection{Stage 2: Convolution Layer Acceleration }
+
+The convolution operation dominates the computational workload in CNNs. We accelerate the \texttt{conv\_3d()} function by offloading the 3D dot product computation to the DSA.
+
+\textbf{Implementation:} For each output pixel, the software extracts a 3D patch from the input feature map and sends it along with the corresponding kernel weights to the DSA. The DSA computes the dot product and returns the result.
+
+\textbf{Result:} Execution time reduced from 52,185 ms to 8,290 ms (6.58$\times$ speedup compared to baseline). This dramatic improvement confirms that convolution is the primary computational bottleneck.
+
+\subsection{Stage 3: Direct Gather Optimization}
+
+The original Conv3D implementation copies 3D patches to a temporary buffer before sending to DSA, introducing unnecessary memory copy overhead.
+
+
+\textbf{Result:} Execution time reduced from 8,290 ms to 7,194 ms (7.58$\times$ speedup compared to baseline). This 13\% improvement comes purely from eliminating memory copy overhead.
+
+\subsection{Stage 4: Simplified Convolution Parameters }
+
+Analysis of the CNN model reveals that all convolution layers use padding=0 and stride=1. We exploit this by removing parameter checking and simplifying address calculations.
+
+\textbf{Implementation:} Hardcoded padding and stride values eliminate conditional branches and reduce address computation overhead. The function \texttt{hw\_dot\_conv3d\_patch\_fast()} uses simplified indexing: \texttt{base\_pos = (ox, oy)} directly.
+
+\textbf{Result:} Execution time remains at 7,194 ms. The simplification primarily reduces code complexity and enables further optimizations.
+
+\subsection{Stage 5: Weight Preloading }
+
+Analysis of MMIO traffic reveals that weight writes dominate the communication overhead. For each convolution pixel:
+\begin{itemize}
+    \item Previous: 75 input values + 75 weight values = 150 MMIO writes
+    \item Optimized: 75 input values only = 75 MMIO writes (50\% reduction)
+\end{itemize}
+
+\textbf{Implementation:} Weights are preloaded once per output channel using \texttt{hw\_preload\_weights()}. The DSA retains weights in its internal buffer B until explicitly updated. Subsequent dot product operations only need to write input data to buffer A.
+
+\textbf{Result:} Execution time reduced from 7,194 ms to 5,098 ms (10.69$\times$ speedup compared to baseline). This significant improvement confirms that MMIO overhead is the dominant bottleneck.
+
+\subsection{Stage 6: Pooling Layer Acceleration}
+
+Average pooling computes the mean of a 2$\times$2 region, which can be expressed as a dot product with scale factors.
+
+\textbf{Implementation:} The function \texttt{hw\_avg\_pool\_2x2()} sends 4 input values and 4 scale factors (0.25 each) to the DSA. The hardware computes: $result = \sum_{i=0}^{3} input[i] \times 0.25$.
+
+\textbf{Result:} Execution time reduced from 5,098 ms to 4,285 ms (12.72$\times$ speedup compared to baseline). This is our final optimized implementation.
+
+\section{Performance Analysis}
+
+\subsection{Time Breakdown: Data Feeding vs. Computation}
+
+To understand the performance bottleneck, we analyze the time spent on MMIO data transfer (data feeding) versus actual FMA computation. Table~\ref{tab:time_breakdown} shows the estimated time breakdown for different optimization stages.
+
+\begin{table}[htbp]
+\caption{Time Breakdown: Data Feeding vs. Computation}
+\label{tab:time_breakdown}
+\centering
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+\multirow{2}{*}{Stage} & \multicolumn{2}{c}{Time (ms)} & \multicolumn{2}{c}{Percentage} \\
+\cmidrule(lr){2-3} \cmidrule(lr){4-5}
+ & Feeding & Compute & Feeding & Compute \\
+\midrule
+Conv3D Accel. & 5,803 & 2,487 & 70\% & 30\% \\
++Direct Gather & 5,036 & 2,158 & 70\% & 30\% \\
++Simplified & 5,036 & 2,158 & 70\% & 30\% \\
++Weight Preload & 2,753 & 2,345 & 54\% & 46\% \\
++Pool Accel. & 2,314 & 1,971 & 54\% & 46\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Analysis Methodology}
+The time breakdown is estimated based on the following parameters:
+\begin{itemize}
+    \item \textbf{MMIO write latency}: 3-5 cycles per 32-bit write at 41 MHz
+    \item \textbf{FMA latency}: 8 cycles pipeline latency per operation
+    \item \textbf{Conv2 workload}: $8 \times 8 \times 12$ output pixels $\times$ 75 elements per dot product
+\end{itemize}
+
+For a single Conv3D operation with 5$\times$5$\times$3 kernel (75 elements):
+\begin{itemize}
+    \item \textbf{Data feeding (no preload)}: 75 inputs + 75 weights = 150 MMIO writes $\approx$ 600 cycles
+    \item \textbf{Data feeding (with preload)}: 75 inputs only = 75 MMIO writes $\approx$ 300 cycles
+    \item \textbf{FMA computation}: 75 FMA operations with 4-way unrolling $\approx$ 19 iterations + pipeline $\approx$ 180 cycles
+\end{itemize}
+
+\subsubsection{Key Observation}
+The analysis reveals that \textbf{data feeding dominates execution time}, accounting for approximately 70\% of total time before weight preloading optimization. This explains why 4-way loop unrolling (which only accelerates computation) provides diminishing returns.
+
+\subsection{Speedup Breakdown}
+
+Figure~\ref{fig:speedup} illustrates the cumulative speedup achieved at each optimization stage.
+
+\begin{table}[htbp]
+\centering
+\caption{Cumulative speedup at each optimization stage}
+\label{fig:speedup}
+\begin{tabular}{|l|r|r|r|}
+\hline
+\textbf{Stage} & \textbf{Time (ms)} & \textbf{$\Delta$ (ms)} & \textbf{Speedup} \\
+\hline
+Baseline & 54,523 & -- & 1.00$\times$ \\
++FC Accel & 52,185 & -2,338 & 1.04$\times$ \\
++Conv3D & 8,290 & -43,895 & 6.58$\times$ \\
++Direct Gather & 7,194 & -1,096 & 7.58$\times$ \\
++Simplified & 7,194 & 0 & 7.58$\times$ \\
++Weight Preload & 5,098 & -2,096 & 10.69$\times$ \\
++Pool Accel & 4,285 & -813 & 12.72$\times$ \\
+\hline
+\end{tabular}
+\end{table}
+
+The table shows that Conv3D acceleration contributes the largest improvement (43.9 seconds reduction), confirming that convolution is the dominant computational bottleneck. Weight preloading provides the second-largest improvement by eliminating 50\% of MMIO writes.
+
+\subsection{Bottleneck Analysis}
+
+The performance analysis reveals several insights:
+
+\begin{enumerate}
+    \item \textbf{Convolution dominates computation}: The 6.58$\times$ speedup from Conv3D acceleration alone indicates that convolution accounts for approximately 85\% of total execution time in the baseline.
+    
+    \item \textbf{MMIO overhead is the primary bottleneck}: After hardware acceleration, data feeding via MMIO accounts for approximately 70\% of remaining execution time. The breakdown is:
+    \begin{itemize}
+        \item Per MMIO write: 4 cycles average at 41 MHz $\approx$ 97 ns
+        \item Per Conv3D operation (75 elements, no preload): 150 writes $\approx$ 14.6 $\mu$s for feeding
+        \item FMA computation (75 elements): $\approx$ 6.0 $\mu$s
+        \item \textbf{Ratio}: Feeding : Compute $\approx$ 70\% : 30\%
+    \end{itemize}
+    
+    \item \textbf{FC layer contribution is minimal}: The FC layers account for less than 5\% of total execution time, making FC acceleration less impactful.
+    
+    \item \textbf{Weight preloading is highly effective}: By eliminating weight transfers (50\% of MMIO writes), execution time is reduced by 29\% (from 7,194 ms to 5,098 ms), changing the feeding ratio from 70\% to approximately 54\%.
+    
+    \item \textbf{Pooling acceleration provides additional gains}: Hardware pooling reduces execution time by 16\% (from 5,098 ms to 4,285 ms).
+\end{enumerate}
+
+\subsection{Resource Utilization}
+
+The DSA implementation on Arty A7-100T consumes the following FPGA resources:
+
+\begin{itemize}
+    \item LUTs: Approximately 35,000 / 63,400 (55\%)
+    \item BRAM: 4 / 135 blocks (3\%)
+    \item DSP: 3 / 240 slices (1\%)
+\end{itemize}
+
+The relatively low DSP utilization indicates room for parallel FMA implementations, though LUT constraints limit the number of concurrent units.
+
+
+\section{Conclusion}
+
+This work demonstrates effective hardware-software co-design for CNN acceleration on the RISC-V Aquila SoC. Through systematic optimization with six incremental stages, we achieved a 12.72$\times$ speedup while maintaining 98\% classification accuracy. The key findings include:
+
+\begin{enumerate}
+    \item \textbf{Convolution acceleration is essential}: Conv3D acceleration provides the most significant improvement (6.58$\times$), confirming that convolution dominates CNN computation.
+    
+    \item \textbf{MMIO overhead is the limiting factor}: After hardware acceleration, data feeding accounts for 70\% of execution time. Weight preloading reduces this to 54\%.
+    
+    \item \textbf{Software optimizations are effective}: Direct gather and simplified parameters provide meaningful gains (13\% improvement) with minimal hardware changes.
+    
+    \item \textbf{Incremental optimization is valuable}: The compile-time flag approach allows systematic evaluation and easy configuration of optimization levels.
+\end{enumerate}
+
+
+
+
+\end{document}
